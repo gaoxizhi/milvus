@@ -32,7 +32,9 @@ import (
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
 	"github.com/milvus-io/milvus/internal/proxy/channelmgr"
 	"github.com/milvus-io/milvus/internal/proxy/fieldvalidator"
+	"github.com/milvus-io/milvus/internal/proxy/rls"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/rlsutil"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
@@ -40,6 +42,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/messagespb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -63,6 +66,8 @@ type upsertTask struct {
 	idAllocator      *allocator.IDAllocator
 	collectionID     UniqueID
 	chMgr            channelmgr.ChannelsMgr
+	rlsEnabled       bool
+	rlsForce         bool
 	vChannels        []vChan
 	pChannels        []pChan
 	schema           *schemaInfo
@@ -252,6 +257,7 @@ func retrieveByPKs(ctx context.Context, t *upsertTask, ids *schemapb.IDs, output
 		shardclientMgr:     t.node.(*Proxy).shardMgr,
 		chMgr:              t.node.(*Proxy).chMgr,
 		actualChannelsMvcc: channelReadTs,
+		skipRuntimeRLS:     true,
 	}
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Upsert-retrieveByPKs")
 	defer func() {
@@ -270,10 +276,11 @@ func retrieveByPKs(ctx context.Context, t *upsertTask, ids *schemapb.IDs, output
 }
 
 // prepareUpsert prepares function outputs and shares read-based preparation
-// between Full AutoID and Partial Upsert. Only Partial restores retry state,
-// merges old fields, and prepares CAS proofs.
+// between Full AutoID, RLS-enabled Full, and Partial Upsert. Only Partial
+// restores retry state, merges old fields, and prepares CAS proofs.
 func (it *upsertTask) prepareUpsert(ctx context.Context) error {
 	partialUpdate := it.req.GetPartialUpdate()
+	fullAutoID := false
 	if partialUpdate {
 		if it.partialUpdateOriginalFields == nil {
 			return merr.WrapErrServiceInternalMsg("partial update: original request fields are unavailable")
@@ -301,13 +308,16 @@ func (it *upsertTask) prepareUpsert(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if !primaryField.GetAutoID() {
+		fullAutoID = primaryField.GetAutoID()
+		if !fullAutoID && !it.rlsEnabled {
 			return nil
 		}
-		// Validate lookup PKs before querying; complete-payload validation stays
-		// in insertPreExecute, without inheriting omitted fields from old rows.
-		if _, err := checkUpsertPrimaryFieldData(it.schema, it.upsertMsg.InsertMsg.GetFieldsData(), it.upsertMsg.InsertMsg.NRows(), nil); err != nil {
-			return err
+		if fullAutoID {
+			// Validate lookup PKs before querying; complete-payload validation stays
+			// in insertPreExecute, without inheriting omitted fields from old rows.
+			if _, err := checkUpsertPrimaryFieldData(it.schema, it.upsertMsg.InsertMsg.GetFieldsData(), it.upsertMsg.InsertMsg.NRows(), nil); err != nil {
+				return err
+			}
 		}
 	}
 	missingRows, err := it.queryPreExecute(ctx)
@@ -317,8 +327,10 @@ func (it *upsertTask) prepareUpsert(ctx context.Context) error {
 	if !partialUpdate {
 		// Partial allocates before merging; Full retains request order and can
 		// apply the same missing-row allocation directly to its insert fields.
-		if _, err := it.allocateMissingAutoIDs(missingRows); err != nil {
-			return err
+		if fullAutoID {
+			if _, err := it.allocateMissingAutoIDs(missingRows); err != nil {
+				return err
+			}
 		}
 	}
 	it.upsertMsg.InsertMsg.FieldsData = it.insertFieldData
@@ -366,10 +378,22 @@ func (it *upsertTask) queryPreExecute(ctx context.Context) ([]int, error) {
 		return nil, nil
 	}
 
+	principalName, enforceRLS, err := rls.ResolveRuntimePrincipal(it.rlsEnabled, it.req.GetRlsPrincipal(), "upsert")
+	if err != nil {
+		return nil, err
+	}
+	var (
+		usingExpr *planpb.Expr
+		usingErr  error
+	)
+	if enforceRLS && !partialUpdate {
+		usingExpr, usingErr = rls.ResolveUsingPredicate(ctx, it.collectionID, principalName, rlsutil.PolicyActionUpsert, it.schema.SchemaHelper)
+	}
+
 	tr := timerecord.NewTimeRecorder("Proxy-Upsert-retrieveByPKs")
-	outputFields := []string{"*"}
-	if !partialUpdate {
-		outputFields = []string{primaryFieldSchema.GetName()}
+	outputFields, err := upsertRetrieveOutputFields(it.schema.SchemaHelper, primaryFieldSchema, usingExpr, partialUpdate)
+	if err != nil {
+		return nil, err
 	}
 	resp, storageCost, err := retrieveByPKs(ctx, it, upsertIDs, outputFields)
 	if err != nil {
@@ -377,8 +401,17 @@ func (it *upsertTask) queryPreExecute(ctx context.Context) ([]int, error) {
 	}
 	it.storageCost.ScannedRemoteBytes += storageCost.ScannedRemoteBytes
 	it.storageCost.ScannedTotalBytes += storageCost.ScannedTotalBytes
-	if partialUpdate && len(resp.GetFieldsData()) == 0 {
-		return nil, merr.WrapErrParameterInvalidMsg("retrieve by primary key failed, no data found")
+	if len(resp.GetFieldsData()) == 0 {
+		if partialUpdate {
+			return nil, merr.WrapErrParameterInvalidMsg("retrieve by primary key failed, no data found")
+		}
+		missingRows := make([]int, upsertIDSize)
+		for i := range missingRows {
+			missingRows[i] = i
+		}
+		it.deletePKs = &schemapb.IDs{}
+		it.insertFieldData = it.upsertMsg.InsertMsg.GetFieldsData()
+		return missingRows, nil
 	}
 	// Both modes rely on the standard Query contract for PK type and lookup scope.
 	existFieldData := resp.GetFieldsData()
@@ -389,6 +422,19 @@ func (it *upsertTask) queryPreExecute(ctx context.Context) ([]int, error) {
 	existIDs, err := parsePrimaryFieldData2IDs(pkFieldData)
 	if err != nil {
 		return nil, err
+	}
+	existRowNum := typeutil.GetSizeOfIDs(existIDs)
+	if existRowNum > 0 && enforceRLS {
+		if partialUpdate {
+			usingExpr, usingErr = rls.ResolveUsingPredicate(ctx, it.collectionID, principalName, rlsutil.PolicyActionUpsert, it.schema.SchemaHelper)
+		}
+		if usingErr != nil {
+			return nil, usingErr
+		}
+		if err := rls.ValidateRowsByPredicate(ctx, existFieldData, existRowNum, usingExpr, "upsert", "using"); err != nil {
+			log.Warn(ctx, "RLS using expression validation failed for upsert", mlog.Err(err))
+			return nil, err
+		}
 	}
 
 	var insertIdxInUpsert, updateIdxInUpsert []int
@@ -418,7 +464,7 @@ func (it *upsertTask) queryPreExecute(ctx context.Context) ([]int, error) {
 
 	// Include Retrieve and PK classification, before Partial field normalization.
 	log.Info(ctx, "retrieveByPKs cost",
-		mlog.Int("resultNum", typeutil.GetSizeOfIDs(existIDs)),
+		mlog.Int("resultNum", existRowNum),
 		mlog.Int64("latency", tr.ElapseSpan().Milliseconds()),
 		mlog.Bool("partialUpdate", partialUpdate),
 		mlog.Int("existingCount", upsertIDSize-len(insertIdxInUpsert)),
@@ -846,6 +892,29 @@ func (it *upsertTask) allocateMissingAutoIDs(missingRows []int) (*schemapb.IDs, 
 		it.partialUpdateResultIDs = rewrittenIDs
 	}
 	return rewrittenIDs, nil
+}
+
+func upsertRetrieveOutputFields(schemaHelper *typeutil.SchemaHelper, primaryField *schemapb.FieldSchema, usingExpr *planpb.Expr, partialUpdate bool) ([]string, error) {
+	if partialUpdate {
+		return []string{"*"}, nil
+	}
+	if schemaHelper == nil || primaryField == nil {
+		return nil, merr.WrapErrServiceInternalMsg("failed to resolve upsert retrieve fields without schema metadata")
+	}
+	outputFields := []string{primaryField.GetName()}
+	seen := map[int64]struct{}{primaryField.GetFieldID(): {}}
+	for _, fieldID := range rls.ReferencedFieldIDs(usingExpr) {
+		if _, ok := seen[fieldID]; ok {
+			continue
+		}
+		field, err := schemaHelper.GetFieldFromID(fieldID)
+		if err != nil {
+			return nil, merr.Wrapf(err, "failed to resolve RLS upsert field %d", fieldID)
+		}
+		seen[fieldID] = struct{}{}
+		outputFields = append(outputFields, field.GetName())
+	}
+	return outputFields, nil
 }
 
 // ToCompressedFormatNullable converts nullable field data from full format to compressed format.
@@ -1701,6 +1770,18 @@ func (it *upsertTask) insertPreExecute(ctx context.Context) error {
 		return err
 	}
 
+	principalName, enforceRLS, err := rls.ResolveRuntimePrincipal(it.rlsEnabled, it.req.GetRlsPrincipal(), "upsert")
+	if err != nil {
+		return err
+	}
+	if enforceRLS {
+		if err := rls.ValidateCheckForWrite(ctx, it.collectionID, principalName,
+			rlsutil.PolicyActionUpsert, it.upsertMsg.InsertMsg.GetFieldsData(), it.schema.SchemaHelper, int(it.upsertMsg.InsertMsg.NRows()), "upsert"); err != nil {
+			log.Warn(ctx, "RLS check expression validation failed for upsert", mlog.Err(err))
+			return err
+		}
+	}
+
 	log.Debug(ctx, "Proxy Upsert insertPreExecute done")
 
 	return nil
@@ -1785,6 +1866,8 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 		log.Warn(ctx, "fail to get collection info", mlog.Err(err))
 		return err
 	}
+	it.rlsEnabled = colInfo.RlsEnabled
+	it.rlsForce = colInfo.RlsForce
 
 	if it.schemaTimestamp != 0 {
 		if it.schemaTimestamp != colInfo.UpdateTimestamp {
@@ -1905,6 +1988,12 @@ func (it *upsertTask) PreExecute(ctx context.Context) error {
 	// check if num_rows is valid
 	if it.req.NumRows <= 0 {
 		return merr.WrapErrParameterInvalid("invalid num_rows", fmt.Sprint(it.req.NumRows), "num_rows should be greater than 0")
+	}
+
+	it.rlsEnabled, err = resolveRLSEnforcement(ctx, it.GetMetaCache(), it.rlsEnabled, it.rlsForce, it.req.GetSkipRls(),
+		it.req.GetDbName(), collectionName, "upsert")
+	if err != nil {
+		return err
 	}
 
 	if it.req.GetPartialUpdate() {
