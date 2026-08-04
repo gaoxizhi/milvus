@@ -36,7 +36,6 @@ import (
 	"github.com/milvus-io/milvus/internal/metastore"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
-	"github.com/milvus-io/milvus/internal/parser/planparserv2/rewriter"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/tso"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
@@ -3027,8 +3026,13 @@ func validateRLSPolicyExpression(schemaHelper *typeutil.SchemaHelper, exprKind s
 	if err != nil {
 		return merr.WrapErrParameterInvalidErr(err, "invalid RLS %s expression", exprKind)
 	}
-	if err := validateRLSParsedExpr(parsedExpr, allowedTemplateVariables); err != nil {
+	if err := rlsutil.ValidateParsedExpression(parsedExpr, allowedTemplateVariables); err != nil {
 		return merr.Wrapf(err, "invalid RLS %s expression", exprKind)
+	}
+	if exprKind == "using" {
+		if err := rlsutil.ValidateUsingExpressionSchema(schemaHelper, parsedExpr); err != nil {
+			return merr.Wrapf(err, "invalid RLS %s expression", exprKind)
+		}
 	}
 	if enforceArrayLiteralLimit {
 		if err := validateRLSArrayLiteralLimit(parsedExpr); err != nil {
@@ -3089,97 +3093,6 @@ func rejectRawRLSTemplatePlaceholders(expr string) error {
 	return nil
 }
 
-func validateRLSParsedExpr(expr *planpb.Expr, allowedTemplateVariables map[string]struct{}) error {
-	if expr == nil {
-		return merr.WrapErrParameterInvalidMsg("RLS expression is empty")
-	}
-	if rewriter.IsAlwaysFalseExpr(expr) {
-		return nil
-	}
-	switch node := expr.GetExpr().(type) {
-	case *planpb.Expr_AlwaysTrueExpr:
-		return nil
-	case *planpb.Expr_ValueExpr:
-		if _, ok := node.ValueExpr.GetValue().GetVal().(*planpb.GenericValue_BoolVal); !ok {
-			return merr.WrapErrParameterInvalidMsg("RLS value expression must be boolean")
-		}
-		return nil
-	case *planpb.Expr_UnaryExpr:
-		return merr.WrapErrParameterInvalidMsg("compound RLS expressions are not supported for RLS policy validation")
-	case *planpb.Expr_UnaryRangeExpr:
-		return validateRLSUnaryRangeExpr(node.UnaryRangeExpr, allowedTemplateVariables)
-	case *planpb.Expr_TermExpr:
-		return validateRLSTermExpr(node.TermExpr, allowedTemplateVariables)
-	case *planpb.Expr_JsonContainsExpr:
-		return validateRLSJSONContainsExpr(node.JsonContainsExpr, allowedTemplateVariables)
-	case *planpb.Expr_BinaryExpr:
-		return merr.WrapErrParameterInvalidMsg("compound RLS expressions are not supported for RLS policy validation")
-	default:
-		return merr.WrapErrParameterInvalidMsg("unsupported RLS policy expression node %T", node)
-	}
-}
-
-func validateRLSUnaryRangeExpr(expr *planpb.UnaryRangeExpr, allowedTemplateVariables map[string]struct{}) error {
-	if expr.GetOp() != planpb.OpType_Equal {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression only supports equality comparison")
-	}
-	if expr.GetValue() == nil && expr.GetTemplateVariableName() == "" {
-		return merr.WrapErrParameterInvalidMsg("RLS equality comparison requires a value or principal variable")
-	}
-	if err := validateRLSTemplateVariable(expr.GetTemplateVariableName(), allowedTemplateVariables); err != nil {
-		return err
-	}
-	if err := validateRLSScalarColumn(expr.GetColumnInfo()); err != nil {
-		return err
-	}
-	if expr.GetTemplateVariableName() == funcutil.RLSPrincipalTemplateName && !typeutil.IsStringType(expr.GetColumnInfo().GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS current principal can only be compared with string fields")
-	}
-	return nil
-}
-
-func validateRLSTermExpr(expr *planpb.TermExpr, allowedTemplateVariables map[string]struct{}) error {
-	if expr.GetIsInField() {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression does not support field-to-field IN")
-	}
-	if err := validateRLSTemplateVariable(expr.GetTemplateVariableName(), allowedTemplateVariables); err != nil {
-		return err
-	}
-	if expr.GetTemplateVariableName() != "" {
-		return merr.WrapErrParameterInvalidMsg("RLS principal variables cannot be used as IN-list templates")
-	}
-	return validateRLSScalarColumn(expr.GetColumnInfo())
-}
-
-func validateRLSJSONContainsExpr(expr *planpb.JSONContainsExpr, allowedTemplateVariables map[string]struct{}) error {
-	if err := validateRLSTemplateVariable(expr.GetTemplateVariableName(), allowedTemplateVariables); err != nil {
-		return err
-	}
-	column := expr.GetColumnInfo()
-	if err := validateRLSTopLevelColumn(column); err != nil {
-		return err
-	}
-	if !typeutil.IsArrayType(column.GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression only supports array_contains on array fields")
-	}
-	if !typeutil.IsPrimitiveType(column.GetElementType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression only supports primitive array element fields")
-	}
-	switch expr.GetOp() {
-	case planpb.JSONContainsExpr_Contains:
-	case planpb.JSONContainsExpr_ContainsAll, planpb.JSONContainsExpr_ContainsAny:
-		if expr.GetTemplateVariableName() != "" {
-			return merr.WrapErrParameterInvalidMsg("RLS principal variables can only be used with array_contains")
-		}
-	default:
-		return merr.WrapErrParameterInvalidMsg("unsupported RLS array_contains operator %s", expr.GetOp().String())
-	}
-	if expr.GetTemplateVariableName() == funcutil.RLSPrincipalTemplateName && !typeutil.IsStringType(column.GetElementType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS current principal can only be compared with string array fields")
-	}
-	return nil
-}
-
 func validateRLSArrayLiteralLimit(expr *planpb.Expr) error {
 	maxElements := Params.ProxyCfg.RLSMaxArrayLiteralElements.GetAsInt()
 	var elements int
@@ -3191,45 +3104,6 @@ func validateRLSArrayLiteralLimit(expr *planpb.Expr) error {
 	}
 	if elements > maxElements {
 		return merr.WrapErrParameterInvalidMsg("RLS policy expression exceeds max array literal elements %d", maxElements)
-	}
-	return nil
-}
-
-func validateRLSTemplateVariable(templateVariable string, allowedTemplateVariables map[string]struct{}) error {
-	if templateVariable == "" {
-		return nil
-	}
-	if _, ok := allowedTemplateVariables[templateVariable]; !ok {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression contains unsupported template variable %q", templateVariable)
-	}
-	return nil
-}
-
-func validateRLSScalarColumn(column *planpb.ColumnInfo) error {
-	if err := validateRLSTopLevelColumn(column); err != nil {
-		return err
-	}
-	if !typeutil.IsPrimitiveType(column.GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression only supports top-level scalar fields")
-	}
-	return nil
-}
-
-func validateRLSTopLevelColumn(column *planpb.ColumnInfo) error {
-	if column == nil {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression has empty column info")
-	}
-	if common.IsSystemField(column.GetFieldId()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression does not support system fields")
-	}
-	if len(column.GetNestedPath()) > 0 || column.GetIsElementLevel() {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression does not support nested or element-level fields")
-	}
-	if typeutil.IsVectorType(column.GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression does not support vector fields")
-	}
-	if typeutil.IsJSONType(column.GetDataType()) {
-		return merr.WrapErrParameterInvalidMsg("RLS policy expression does not support JSON fields")
 	}
 	return nil
 }

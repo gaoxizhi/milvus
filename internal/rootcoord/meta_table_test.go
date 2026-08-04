@@ -650,6 +650,18 @@ func TestMetaTable_RLSMetadata(t *testing.T) {
 			Name:     "ts",
 			DataType: schemapb.DataType_Timestamptz,
 			State:    schemapb.FieldState_FieldCreated,
+		}, &model.Field{
+			FieldID:  109,
+			Name:     "enabled",
+			DataType: schemapb.DataType_Bool,
+			State:    schemapb.FieldState_FieldCreated,
+		}, &model.Field{
+			FieldID:         110,
+			Name:            "nullable_tags",
+			DataType:        schemapb.DataType_Array,
+			ElementType:     schemapb.DataType_VarChar,
+			ElementNullable: true,
+			State:           schemapb.FieldState_FieldCreated,
 		})
 		coll.Properties = append(coll.Properties, &commonpb.KeyValuePair{Key: common.TimezoneKey, Value: "Asia/Shanghai"})
 		require.NoError(t, validateRLSPolicyExpressions(coll, "ts == ISO '2025-01-01 00:00:00'", ""))
@@ -671,6 +683,9 @@ func TestMetaTable_RLSMetadata(t *testing.T) {
 			"json_contains(metadata, \"sales\")",
 			"array_contains(scores, $current_principal)",
 			"array_contains_all(tags, $current_principal_tags['tags'])",
+			"ts == $current_principal_tags['ts']",
+			"enabled == $current_principal_tags['enabled']",
+			`array_contains(nullable_tags, "red")`,
 		}
 		for _, expr := range invalidExprs {
 			err := validateRLSPolicyExpressions(coll, expr, "")
@@ -684,10 +699,11 @@ func TestMetaTable_RLSMetadata(t *testing.T) {
 			err := validateRLSPolicyExpressions(coll, expr, "")
 			require.ErrorContains(t, err, "compound RLS expressions are not supported")
 		}
-		require.ErrorIs(t, validateRLSUnaryRangeExpr(&planpb.UnaryRangeExpr{
+		require.NoError(t, validateRLSPolicyExpressions(coll, "", `array_contains(nullable_tags, "red")`))
+		require.ErrorIs(t, rlsutil.ValidateParsedExpression(&planpb.Expr{Expr: &planpb.Expr_UnaryRangeExpr{UnaryRangeExpr: &planpb.UnaryRangeExpr{
 			ColumnInfo: &planpb.ColumnInfo{FieldId: 101, DataType: schemapb.DataType_VarChar},
 			Op:         planpb.OpType_Equal,
-		}, nil), merr.ErrParameterInvalid)
+		}}}, nil), merr.ErrParameterInvalid)
 		malformedTagExpr := "dept == $current_principal_tags['x'y'] and dept == {raw}"
 		require.ErrorIs(t, validateRLSPolicyExpressionsWithSchema(
 			coll.ToCollectionSchemaPB(),

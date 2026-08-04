@@ -164,7 +164,12 @@ func (m *manager) ensurePrincipalTags(ctx context.Context, collectionID UniqueID
 	}
 
 	key := principalKey{collectionID: collectionID, principalName: principalName}
-	if entry := m.getPrincipalTagsEntry(key); entry != nil {
+	refreshTTL := paramtable.Get().ProxyCfg.RLSMetaRefreshInterval.GetAsDuration(time.Second)
+	if refreshTTL <= 0 {
+		return nil, merr.WrapErrServiceInternalMsg("failed to validate RLS principal freshness with invalid TTL %s", refreshTTL)
+	}
+	now := time.Now()
+	if entry := m.getPrincipalTagsEntry(key); principalTagsEntryFresh(entry, refreshTTL, now) {
 		return entry.tags, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -174,7 +179,7 @@ func (m *manager) ensurePrincipalTags(ctx context.Context, collectionID UniqueID
 	if coord == nil || refreshCtx == nil {
 		return nil, merr.WrapErrServiceInternalMsg("failed to refresh RLS principal tags without coord client")
 	}
-	entry, resultCh, err := m.startPrincipalRefresh(key, time.Now(), func(state *collectionState, token principalRefreshToken) (any, error) {
+	entry, resultCh, err := m.startPrincipalRefresh(key, refreshTTL, func(state *collectionState, token principalRefreshToken) (any, error) {
 		if !m.principalRefreshCurrent(key, state, token) {
 			return nil, merr.WrapErrServiceUnavailableMsg("RLS principal %q metadata changed before refresh", principalName)
 		}

@@ -833,7 +833,7 @@ func TestManagerPrincipalRefreshInvalidationIsPrincipalScoped(t *testing.T) {
 	require.NotNil(t, m.getPrincipalTagsEntry(principalKey{collectionID: 100, principalName: "alice"}))
 }
 
-func TestManagerPrincipalTTLScannerEvictsExpiredEntries(t *testing.T) {
+func TestManagerPrincipalTTLRefreshesExpiredEntriesOnLookup(t *testing.T) {
 	m := newManager()
 	coord := &metadataTestCoord{
 		principalTags: map[string]map[string]string{
@@ -854,20 +854,15 @@ func TestManagerPrincipalTTLScannerEvictsExpiredEntries(t *testing.T) {
 
 	aliceTags, err := m.ensurePrincipalTags(context.Background(), 100, "alice")
 	require.NoError(t, err)
-	require.Equal(t, rlsutil.NewStringTagValue("old"), aliceTags["tenant"])
+	require.Equal(t, rlsutil.NewStringTagValue("new"), aliceTags["tenant"])
 	bobTags, err := m.ensurePrincipalTags(context.Background(), 100, "bob")
 	require.NoError(t, err)
 	require.Equal(t, rlsutil.NewStringTagValue("unchanged"), bobTags["tenant"])
-	require.Zero(t, coord.principalCalls.Load())
+	require.Equal(t, int32(1), coord.principalCalls.Load())
 
 	m.expirePrincipalTags(time.Now())
-	require.NotContains(t, m.collections[100].principalTags, "alice")
+	require.Contains(t, m.collections[100].principalTags, "alice")
 	require.Contains(t, m.collections[100].principalTags, "bob")
-
-	aliceTags, err = m.ensurePrincipalTags(context.Background(), 100, "alice")
-	require.NoError(t, err)
-	require.Equal(t, rlsutil.NewStringTagValue("new"), aliceTags["tenant"])
-	require.Equal(t, int32(1), coord.principalCalls.Load())
 }
 
 func TestManagerPrincipalCacheScannerDeletesExpiredEntries(t *testing.T) {

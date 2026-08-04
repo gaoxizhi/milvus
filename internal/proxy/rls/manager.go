@@ -43,6 +43,7 @@ type collectionState struct {
 	policyRefreshedAt time.Time
 	policyBackoff     *typeutil.BackoffWithInstant
 	policies          map[string]*rlsutil.RowPolicy
+	compiled          map[compiledKey]*compiledCacheEntry
 
 	// Principal tags are cached and invalidated independently per principal.
 	principalTags            map[string]*principalTagsEntry
@@ -66,6 +67,8 @@ type principalRefreshToken uint64
 
 type manager struct {
 	mu sync.RWMutex
+
+	// Per-collection cache state.
 	// ponytail: collection states and drop tombstones are unbounded; add an LRU
 	// or byte budget if production scale makes this measurable.
 	collections map[UniqueID]*collectionState
@@ -77,7 +80,7 @@ type manager struct {
 	coord      CoordClient
 	refreshCtx context.Context
 
-	// Use the native group so canceled callers do not leave one waiter goroutine each.
+	// Independent policy and principal refresh coalescing.
 	policyRefreshes    singleflight.Group
 	principalRefreshes singleflight.Group
 }
@@ -151,6 +154,10 @@ func (m *manager) getPrincipalTagsEntry(key principalKey) *principalTagsEntry {
 	return state.principalTags[key.principalName]
 }
 
+func principalTagsEntryFresh(entry *principalTagsEntry, refreshTTL time.Duration, now time.Time) bool {
+	return entry != nil && entry.refreshedAt.Add(refreshTTL).After(now)
+}
+
 func (m *manager) invalidatePolicies(collectionID UniqueID, revision typeutil.Timestamp) {
 	if m == nil || collectionID == 0 {
 		return
@@ -179,6 +186,7 @@ func (m *manager) invalidatePolicies(collectionID UniqueID, revision typeutil.Ti
 	state.policyRefreshedAt = time.Time{}
 	state.policyBackoff = nil
 	state.policies = nil
+	state.compiled = nil
 	state.mu.Unlock()
 	m.mu.Unlock()
 }
@@ -337,7 +345,7 @@ func (m *manager) policyRefreshCurrent(collectionID UniqueID, state *collectionS
 
 func (m *manager) startPrincipalRefresh(
 	key principalKey,
-	now time.Time,
+	refreshTTL time.Duration,
 	refresh func(*collectionState, principalRefreshToken) (any, error),
 ) (*principalTagsEntry, <-chan singleflight.Result, error) {
 	m.mu.RLock()
@@ -348,8 +356,12 @@ func (m *manager) startPrincipalRefresh(
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	now := time.Now()
 	if entry := state.principalTags[key.principalName]; entry != nil {
-		return entry, nil, nil
+		if principalTagsEntryFresh(entry, refreshTTL, now) {
+			return entry, nil, nil
+		}
+		delete(state.principalTags, key.principalName)
 	}
 	if backoff := state.principalBackoffs[key.principalName]; backoff != nil && now.Before(backoff.NextInstant()) {
 		return nil, nil, merr.WrapErrServiceUnavailableMsg(
@@ -433,5 +445,6 @@ func (state *collectionState) rememberInvalidationRevision(revision typeutil.Tim
 func (state *collectionState) setPreparedPolicySnapshotLocked(refreshedAt time.Time, policies map[string]*rlsutil.RowPolicy) {
 	state.policyRefreshedAt = refreshedAt
 	state.policyBackoff = nil
+	state.compiled = nil
 	state.policies = policies
 }
